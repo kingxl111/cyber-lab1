@@ -6,3 +6,18 @@ venv
 .code
 *.pt
 *.json
+
+# GTSRB dataset (~600MB)
+Train/
+Test/
+Meta/
+train/
+test/
+meta/
+Train.csv
+Test.csv
+Meta.csv
+
+# Old tabular dataset
+data/customer_booking.csv
+

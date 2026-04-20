@@ -6,9 +6,9 @@ import os
 
 import torch
 import torch.nn as nn
-from torchvision import models
 
 from src.data import NUM_CLASSES, compute_class_weights, make_loaders, make_splits
+from src.models import SimpleCNN
 from src.plots import (
     plot_accuracy,
     plot_confusion_matrix_multiclass,
@@ -28,52 +28,35 @@ for _d in (CKPT_DIR, RESULTS_DIR, PLOTS_DIR):
     os.makedirs(_d, exist_ok=True)
 
 
-def build_model(name: str, num_classes: int, pretrained: bool) -> nn.Module:
-    name = name.lower()
-
-    if name == "resnet18":
-        weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        model = models.resnet18(weights=weights)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
-        return model
-
-    if name == "vit_b_16":
-        weights = models.ViT_B_16_Weights.IMAGENET1K_V1 if pretrained else None
-        model = models.vit_b_16(weights=weights)
-        model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
-        return model
-
-    raise ValueError(f"Unknown model: {name}")
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", choices=["resnet18", "vit_b_16"], required=True)
-    parser.add_argument("--variant", choices=["baseline", "improved"], required=True)
+    parser.add_argument(
+        "--variant",
+        choices=["baseline", "improved"],
+        required=True,
+        help="baseline - чистая собственная CNN без техник; "
+        "improved - с техниками из улучшенного бейзлайна (п.4f ТЗ).",
+    )
     parser.add_argument("--data-root", type=str, default=DATA_ROOT)
-    parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    batch_size = args.batch_size if args.batch_size is not None else (
-        64 if args.model == "resnet18" else 32
-    )
     epochs = args.epochs if args.epochs is not None else (
-        6 if args.variant == "baseline" else 12
+        15 if args.variant == "baseline" else 25
     )
-    pretrained = not args.no_pretrained
+    dropout = 0.2 if args.variant == "baseline" else 0.45
 
-    run_name = f"{args.model}_{args.variant}"
+    run_name = f"customcnn_{args.variant}"
     print(f"Device: {device}")
-    print(f"Run: {run_name} | pretrained={pretrained} | image_size={args.image_size} | "
-          f"batch_size={batch_size} | epochs={epochs}")
+    print(f"Run: {run_name} | image_size={args.image_size} | "
+          f"batch_size={args.batch_size} | epochs={epochs} | dropout={dropout}")
 
     splits = make_splits(args.data_root, val_size=0.15, seed=args.seed)
     train_loader, val_loader, test_loader = make_loaders(
@@ -81,12 +64,14 @@ def main():
         splits=splits,
         image_size=args.image_size,
         variant=args.variant,
-        pretrained_stats=True,
-        batch_size=batch_size,
+        pretrained_stats=False,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
 
-    model = build_model(args.model, NUM_CLASSES, pretrained=pretrained).to(device)
+    model = SimpleCNN(num_classes=NUM_CLASSES, dropout=dropout).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"SimpleCNN parameters: {n_params:,}")
 
     class_weights = compute_class_weights(splits.train_df).to(device)
 
@@ -94,12 +79,12 @@ def main():
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         scheduler = None
-        patience = 3
+        patience = 4
     else:
         criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=5e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-        patience = 4
+        patience = 6
 
     model, history = train_model(
         model=model,
@@ -128,13 +113,13 @@ def main():
     with open(os.path.join(RESULTS_DIR, f"{run_name}_summary.json"), "w", encoding="utf-8") as f:
         json.dump(
             {
-                "model": args.model,
+                "model": "SimpleCNN",
                 "variant": args.variant,
-                "pretrained": pretrained,
                 "image_size": args.image_size,
-                "batch_size": batch_size,
+                "batch_size": args.batch_size,
                 "epochs_config": epochs,
                 "epochs_trained": int(history.shape[0]),
+                "num_parameters": n_params,
                 "test_metrics": test_metrics,
             },
             f,

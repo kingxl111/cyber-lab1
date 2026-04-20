@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import os
-import json
 import random
-from dataclasses import asdict, is_dataclass
 from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from torch.utils.data import DataLoader
 
 
 def seed_everything(seed: int = 42):
@@ -22,61 +26,77 @@ def seed_everything(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-def make_loader(X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
-    X_t = torch.tensor(X, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.long)
-    ds = TensorDataset(X_t, y_t)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
-
-
 @torch.no_grad()
-def predict_proba(model, loader, device):
+def predict_proba_multiclass(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
-    y_true, y_pred, y_prob = [], [], []
+    all_true, all_pred, all_prob = [], [], []
 
     for x, y in loader:
-        x = x.to(device)
+        x = x.to(device, non_blocking=True)
         logits = model(x)
-        prob = torch.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
-        pred = torch.argmax(logits, dim=1).detach().cpu().numpy()
+        prob = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        pred = prob.argmax(axis=1)
 
-        y_true.extend(y.numpy().tolist())
-        y_pred.extend(pred.tolist())
-        y_prob.extend(prob.tolist())
+        all_true.append(y.numpy())
+        all_pred.append(pred)
+        all_prob.append(prob)
 
-    return np.array(y_true), np.array(y_pred), np.array(y_prob)
+    y_true = np.concatenate(all_true)
+    y_pred = np.concatenate(all_pred)
+    y_prob = np.concatenate(all_prob, axis=0)
+    return y_true, y_pred, y_prob
 
 
-def compute_metrics(y_true, y_pred, y_prob) -> Dict[str, float]:
+def compute_metrics_multiclass(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray,
+    num_classes: int,
+) -> Dict[str, float]:
     metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
+        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_weighted": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
     }
     try:
-        metrics["roc_auc"] = roc_auc_score(y_true, y_prob)
+        y_true_oh = np.eye(num_classes, dtype=np.float32)[y_true]
+        metrics["roc_auc_ovr_macro"] = float(
+            roc_auc_score(y_true_oh, y_prob, multi_class="ovr", average="macro")
+        )
     except Exception:
-        metrics["roc_auc"] = float("nan")
+        metrics["roc_auc_ovr_macro"] = float("nan")
     return metrics
 
 
-def evaluate(model, loader, device):
-    y_true, y_pred, y_prob = predict_proba(model, loader, device)
-    return compute_metrics(y_true, y_pred, y_prob), y_true, y_pred, y_prob
+def evaluate_multiclass(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+) -> Tuple[Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
+    y_true, y_pred, y_prob = predict_proba_multiclass(model, loader, device)
+    metrics = compute_metrics_multiclass(y_true, y_pred, y_prob, num_classes)
+    return metrics, y_true, y_pred, y_prob
 
 
 def train_model(
-    model,
-    train_loader,
-    val_loader,
-    criterion,
-    optimizer,
-    device,
+    model: torch.nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
     scheduler=None,
-    epochs: int = 20,
-    patience: int = 5,
-):
+    epochs: int = 10,
+    patience: int = 4,
+    verbose: bool = True,
+) -> Tuple[torch.nn.Module, pd.DataFrame]:
     history = []
     best_state = None
     best_val_loss = float("inf")
@@ -85,11 +105,13 @@ def train_model(
 
     for epoch in range(1, epochs + 1):
         model.train()
-        total_train_loss = 0.0
+        running_loss = 0.0
+        running_correct = 0
+        running_total = 0
 
         for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             logits = model(x)
@@ -97,21 +119,31 @@ def train_model(
             loss.backward()
             optimizer.step()
 
-            total_train_loss += loss.item() * x.size(0)
+            running_loss += loss.item() * x.size(0)
+            pred = logits.argmax(dim=1)
+            running_correct += (pred == y).sum().item()
+            running_total += x.size(0)
 
-        train_loss = total_train_loss / len(train_loader.dataset)
+        train_loss = running_loss / running_total
+        train_acc = running_correct / running_total
 
         model.eval()
-        total_val_loss = 0.0
+        v_loss = 0.0
+        v_correct = 0
+        v_total = 0
         with torch.no_grad():
             for x, y in val_loader:
-                x = x.to(device)
-                y = y.to(device)
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
                 logits = model(x)
                 loss = criterion(logits, y)
-                total_val_loss += loss.item() * x.size(0)
+                v_loss += loss.item() * x.size(0)
+                pred = logits.argmax(dim=1)
+                v_correct += (pred == y).sum().item()
+                v_total += x.size(0)
 
-        val_loss = total_val_loss / len(val_loader.dataset)
+        val_loss = v_loss / v_total
+        val_acc = v_correct / v_total
 
         if scheduler is not None:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -124,10 +156,19 @@ def train_model(
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "lr": optimizer.param_groups[0]["lr"],
             }
         )
 
-        print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}")
+        if verbose:
+            print(
+                f"Epoch {epoch:02d} | "
+                f"train_loss={train_loss:.4f} acc={train_acc:.4f} | "
+                f"val_loss={val_loss:.4f} acc={val_acc:.4f} | "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}"
+            )
 
         if val_loss < best_val_loss - 1e-6:
             best_val_loss = val_loss
@@ -138,7 +179,8 @@ def train_model(
             no_improve += 1
 
         if no_improve >= patience:
-            print(f"Early stopping. Best epoch: {best_epoch}")
+            if verbose:
+                print(f"Early stopping. Best epoch: {best_epoch} (val_loss={best_val_loss:.4f})")
             break
 
     if best_state is not None:

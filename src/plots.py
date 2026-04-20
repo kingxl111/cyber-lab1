@@ -1,15 +1,11 @@
 from __future__ import annotations
 
 import os
+from typing import Sequence
+
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import (
-    confusion_matrix,
-    roc_curve,
-    auc,
-    precision_recall_curve,
-    average_precision_score,
-)
+from sklearn.metrics import confusion_matrix, f1_score
 
 
 def _ensure_dir(path: str):
@@ -32,70 +28,79 @@ def plot_loss(history, save_path: str, title: str):
     plt.close()
 
 
-def plot_confusion_matrix(y_true, y_pred, save_path: str, title: str):
+def plot_accuracy(history, save_path: str, title: str):
+    if "train_acc" not in history.columns or "val_acc" not in history.columns:
+        return
+
     _ensure_dir(save_path)
 
-    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(8, 5))
+    plt.plot(history["epoch"], history["train_acc"], label="Train acc")
+    plt.plot(history["epoch"], history["val_acc"], label="Val acc")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
 
-    plt.figure(figsize=(5, 5))
-    plt.imshow(cm, interpolation="nearest")
+
+def plot_confusion_matrix_multiclass(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    save_path: str,
+    title: str,
+    num_classes: int,
+    normalize: bool = True,
+):
+    _ensure_dir(save_path)
+
+    labels = list(range(num_classes))
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    if normalize:
+        cm = cm.astype(np.float32)
+        row_sums = cm.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        cm = cm / row_sums
+
+    size = max(8, int(num_classes * 0.25))
+    plt.figure(figsize=(size, size))
+    plt.imshow(cm, interpolation="nearest", cmap="viridis", aspect="auto")
     plt.title(title)
     plt.colorbar()
-    ticks = np.arange(2)
-    plt.xticks(ticks, ["0", "1"])
-    plt.yticks(ticks, ["0", "1"])
+    tick_step = max(1, num_classes // 20)
+    ticks = np.arange(0, num_classes, tick_step)
+    plt.xticks(ticks, [str(t) for t in ticks], rotation=90, fontsize=7)
+    plt.yticks(ticks, [str(t) for t in ticks], fontsize=7)
     plt.xlabel("Predicted")
     plt.ylabel("True")
-
-    thresh = cm.max() / 2.0 if cm.max() > 0 else 0.5
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(
-                j,
-                i,
-                format(cm[i, j], "d"),
-                ha="center",
-                va="center",
-                color="white" if cm[i, j] > thresh else "black",
-            )
-
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path, dpi=180)
     plt.close()
 
 
-def plot_roc_curve(y_true, y_prob, save_path: str, title: str):
+def plot_per_class_f1(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    save_path: str,
+    title: str,
+    num_classes: int,
+):
     _ensure_dir(save_path)
 
-    fpr, tpr, _ = roc_curve(y_true, y_prob)
-    roc_auc = auc(fpr, tpr)
+    labels = list(range(num_classes))
+    per_class = f1_score(y_true, y_pred, labels=labels, average=None, zero_division=0)
 
-    plt.figure(figsize=(6, 6))
-    plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.3f}")
-    plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
+    plt.figure(figsize=(max(8, num_classes * 0.3), 4))
+    plt.bar(labels, per_class)
+    plt.xlabel("Class id")
+    plt.ylabel("F1-score")
     plt.title(title)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.ylim(0, 1.0)
+    plt.grid(True, axis="y", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
-
-
-def plot_pr_curve(y_true, y_prob, save_path: str, title: str):
-    _ensure_dir(save_path)
-
-    precision, recall, _ = precision_recall_curve(y_true, y_prob)
-    ap = average_precision_score(y_true, y_prob)
-
-    plt.figure(figsize=(6, 6))
-    plt.plot(recall, precision, label=f"AP = {ap:.3f}")
-    plt.xlabel("Recall")
-    plt.ylabel("Precision")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
+    plt.savefig(save_path, dpi=180)
     plt.close()
